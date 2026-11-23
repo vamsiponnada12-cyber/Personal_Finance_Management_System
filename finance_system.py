@@ -2,6 +2,9 @@ import json
 import hashlib
 import re
 import uuid
+import math
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -10,6 +13,10 @@ DATA_DIR = Path(__file__).parent / "data"
 USERS_FILE = DATA_DIR / "users.txt"
 TRANSACTIONS_FILE = DATA_DIR / "transactions.txt"
 BUDGETS_FILE = DATA_DIR / "budgets.txt"
+
+
+class DataFileError(Exception):
+    """Raised when stored data is unreadable or does not match the application schema."""
 
 
 class FinanceSystem:
@@ -28,18 +35,116 @@ class FinanceSystem:
             path.write_text(json.dumps(default, indent=4), encoding="utf-8")
 
     @staticmethod
-    def _read_data(path):
+    def _validate_records(path, data):
+        """Validate JSON structure and required fields before application code uses it."""
+        if not isinstance(data, list):
+            raise DataFileError(f"{path.name} must contain a JSON list.")
+
+        schemas = {
+            USERS_FILE.name: {
+                "required": ("user_id", "full_name", "username", "email", "phone",
+                             "password_hash", "created_at"),
+                "strings": ("user_id", "full_name", "username", "email", "phone",
+                            "password_hash", "created_at"),
+            },
+            TRANSACTIONS_FILE.name: {
+                "required": ("transaction_id", "user_id", "type", "amount", "category",
+                             "description", "date", "time"),
+                "strings": ("transaction_id", "user_id", "type", "category",
+                            "description", "date", "time"),
+            },
+            BUDGETS_FILE.name: {
+                "required": ("user_id", "month", "amount"),
+                "strings": ("user_id", "month"),
+            },
+        }
+        schema = schemas.get(path.name)
+        if schema is None:
+            return data
+
+        for index, record in enumerate(data):
+            label = f"{path.name} record {index + 1}"
+            if not isinstance(record, dict):
+                raise DataFileError(f"{label} must be a JSON object.")
+            missing = [field for field in schema["required"] if field not in record]
+            if missing:
+                raise DataFileError(f"{label} is missing required field(s): {', '.join(missing)}.")
+            for field in schema["strings"]:
+                if not isinstance(record[field], str) or not record[field].strip():
+                    raise DataFileError(f"{label}: '{field}' must be a non-empty string.")
+
+            if path.name == USERS_FILE.name:
+                if not re.fullmatch(r"[0-9a-fA-F]{64}", record["password_hash"]):
+                    raise DataFileError(f"{label}: password_hash must be a SHA-256 hash.")
+            elif path.name == TRANSACTIONS_FILE.name:
+                amount = record["amount"]
+                if (isinstance(amount, bool) or not isinstance(amount, (int, float))
+                        or not math.isfinite(amount) or round(amount, 2) <= 0):
+                    raise DataFileError(f"{label}: amount must be a finite positive value of at least Rs. 0.01.")
+                if record["type"] not in ("income", "expense"):
+                    raise DataFileError(f"{label}: type must be 'income' or 'expense'.")
+                try:
+                    if datetime.strptime(record["date"], "%Y-%m-%d").strftime("%Y-%m-%d") != record["date"]:
+                        raise ValueError
+                    datetime.strptime(record["time"], "%H:%M:%S")
+                except ValueError:
+                    raise DataFileError(f"{label}: date/time must use YYYY-MM-DD and HH:MM:SS.")
+            elif path.name == BUDGETS_FILE.name:
+                if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", record["month"]):
+                    raise DataFileError(f"{label}: month must use YYYY-MM.")
+                amount = record["amount"]
+                if (isinstance(amount, bool) or not isinstance(amount, (int, float))
+                        or not math.isfinite(amount) or round(amount, 2) <= 0):
+                    raise DataFileError(f"{label}: amount must be a finite positive value of at least Rs. 0.01.")
+        return data
+
+    @classmethod
+    def _read_data(cls, path):
         try:
             with path.open("r", encoding="utf-8") as file:
-                return json.load(file)
-        except (json.JSONDecodeError, OSError):
-            print(f"Warning: Could not read {path.name}. Starting with empty data.")
-            return []
+                data = json.load(file)
+            return cls._validate_records(path, data)
+        except (json.JSONDecodeError, OSError, UnicodeError, DataFileError) as error:
+            message = (
+                f"DATA RECOVERY REQUIRED: {path.name} could not be safely read "
+                f"({error}). No changes were made. Restore a valid backup or repair "
+                f"the file, then restart the application."
+            )
+            print(message)
+            raise DataFileError(message) from error
 
     @staticmethod
     def _write_data(path, data):
-        with path.open("w", encoding="utf-8") as file:
-            json.dump(data, file, indent=4)
+        """Atomically replace a data file only after a complete successful write."""
+        temporary_path = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False
+            ) as file:
+                temporary_path = Path(file.name)
+                json.dump(data, file, indent=4, allow_nan=False)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary_path, path)
+        except (OSError, TypeError, ValueError) as error:
+            print(f"Save failed: {path.name} was not replaced. Existing records were preserved. "
+                  f"Check file permissions and available disk space. Details: {error}")
+            raise
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                try:
+                    temporary_path.unlink()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _normalize_month(month):
+        """Accept only the canonical zero-padded YYYY-MM representation."""
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+            raise ValueError("Use the exact YYYY-MM format, for example 2026-01.")
+        return month
 
     @staticmethod
     def _hash_password(password):
@@ -71,10 +176,14 @@ class FinanceSystem:
         while True:
             try:
                 amount = float(input(prompt).strip())
-                if amount <= 0:
-                    print("Amount must be greater than zero.")
+                if not math.isfinite(amount):
+                    print("Amount must be a finite number (not NaN or infinity).")
                     continue
-                return round(amount, 2)
+                rounded_amount = round(amount, 2)
+                if rounded_amount <= 0:
+                    print("Amount must be at least Rs. 0.01 after rounding to two decimal places.")
+                    continue
+                return rounded_amount
             except ValueError:
                 print("Please enter a valid number.")
 
@@ -258,9 +367,9 @@ class FinanceSystem:
         if not month:
             month = datetime.now().strftime("%Y-%m")
         try:
-            datetime.strptime(month, "%Y-%m")
-        except ValueError:
-            print("Invalid month format. Use YYYY-MM.")
+            month = self._normalize_month(month)
+        except ValueError as error:
+            print(f"Invalid month format. {error}")
             return
 
         amount = self._read_amount("Monthly budget (Rs.): ")
@@ -281,6 +390,7 @@ class FinanceSystem:
         print(f"Budget for {month} saved: Rs. {amount:.2f}")
 
     def _get_budget(self, month):
+        month = self._normalize_month(month)
         budgets = self._read_data(BUDGETS_FILE)
         for budget in budgets:
             if budget["user_id"] == self.current_user["user_id"] and budget["month"] == month:
@@ -348,9 +458,9 @@ class FinanceSystem:
         if not month:
             month = datetime.now().strftime("%Y-%m")
         try:
-            datetime.strptime(month, "%Y-%m")
-        except ValueError:
-            print("Invalid month format. Use YYYY-MM.")
+            month = self._normalize_month(month)
+        except ValueError as error:
+            print(f"Invalid month format. {error}")
             return
 
         transactions = [
@@ -407,7 +517,7 @@ class FinanceSystem:
             if choice in actions:
                 try:
                     actions[choice]()
-                except (OSError, KeyError, TypeError) as error:
+                except (OSError, DataFileError, KeyError, TypeError, ValueError) as error:
                     print(f"Could not complete this action: {error}")
             elif choice == "10":
                 print(f"Logged out. Goodbye, {self.current_user['full_name']}!")
@@ -429,16 +539,19 @@ class FinanceSystem:
             if choice == "1":
                 try:
                     self.register()
-                except OSError as error:
-                    print(f"Registration could not be saved: {error}")
+                except (OSError, DataFileError) as error:
+                    print(f"Registration could not be completed: {error}")
             elif choice == "2":
-                if self.login():
-                    self.user_menu()
+                try:
+                    if self.login():
+                        self.user_menu()
+                except (OSError, DataFileError) as error:
+                    print(f"Login could not continue: {error}")
             elif choice == "3":
                 try:
                     self.forgot_password()
-                except OSError as error:
-                    print(f"Password reset could not be saved: {error}")
+                except (OSError, DataFileError) as error:
+                    print(f"Password reset could not be completed: {error}")
             elif choice == "4":
                 print("Thank you for using Personal Finance Management System.")
                 break

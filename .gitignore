@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+data/users.txt
+data/transactions.txt
+data/budgets.txt
